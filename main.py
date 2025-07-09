@@ -1,116 +1,99 @@
-from enum import Enum
 import random
 from datetime import datetime, time, timedelta
 from uuid import UUID
 
-from typing import Annotated, Literal
-from fastapi import FastAPI, Query, Path, Body, Cookie, Header
-from pydantic import BaseModel, AfterValidator, Field, HttpUrl
+from typing import Annotated, Any, Union
+from fastapi import FastAPI, Query, Path, Body, Cookie, Header, Response, status, Form, File, UploadFile, HTTPException, Request, Depends
+from fastapi.encoders import jsonable_encoder
+from fastapi.responses import JSONResponse, RedirectResponse, PlainTextResponse
+from fastapi.exception_handlers import (
+    http_exception_handler,
+    request_validation_exception_handler,
+)
+from fastapi.exceptions import RequestValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
+from pydantic import AfterValidator
+
+from models import (ModelName, Image, Item, Offer, User, FilterParams, Cookies, CommonHeaders, UserIn, UserOut, BaseUser,
+                    BaseUserIn, BaseUserOut, BaseUserInDB, BaseItem, PlaneItem, CarItem, FormData, Tags)
+from utiles import (check_valid_id, fake_save_user, common_parameters, verify_key, verify_token, query_or_cookie_extractor,
+                    get_username)
+from varaibles import items, base_items, fake_items_db, data, CommonQueryParams
+from exceptions import UnicornException, OwnerError
 
 app = FastAPI()
-
-data = {
-    "isbn-9781529046137": "The Hitchhiker's Guide to the Galaxy",
-    "imdb-tt0371724": "The Hitchhiker's Guide to the Galaxy",
-    "isbn-9781439512982": "Isaac Asimov: The Complete Stories, Vol. 2",
-}
-
-fake_items_db = [{"item_name": "Foo"}, {"item_name": "Bar"}, {"item_name": "Baz"}]
-
-def check_valid_id(id: str):
-    if not id.startswith(("isbn-", "imdb-")):
-        raise ValueError('Invalid ID format, it must start with "isbn-" or "imdb-"')
-    return id
-
-class ModelName(str, Enum):
-    alexnet = "alexnet"
-    resnet = "resnet"
-    lenet = "lenet"
-
-class Image(BaseModel):
-    url: HttpUrl
-    name: str
-
-class Item(BaseModel):
-    model_config = {
-        "json_schema_extra": {
-            "examples": [
-                {
-                    "name": "Foo",
-                    "description": "A very nice Item",
-                    "price": 35.4,
-                    "tax": 3.2,
-                }
-            ]
-        }
-    }
+# app = FastAPI(dependencies=[Depends(verify_token), Depends(verify_key)])
+# By adding dependencies in the app itself will declare the dependencies as global.
+# So it will be available in whole application.
 
 
-    name: str
-    description: str | None = Field(
-        default=None, title="The description of the item", max_length=300
+
+@app.exception_handler(UnicornException)
+async def unicorn_exception_handler(request: Request, exc: UnicornException):
+    """
+    Custom exception handler of the class UnicorException
+    :param request:
+    :param exc:
+    :return:
+    """
+    return JSONResponse(
+        status_code=418,
+        content={"message": f"Oops! {exc.name} did something. There goes a rainbow..."},
     )
-    price: float = Field(gt=0, description="The price must be greater than zero")
-    tax: float | None = Field(default=None,  examples=[3.2])
-    tags: list = [] #Normal list without type
-    tags_set: set[str] = set()
-    image: Image | None = None #Nested model "image": {
-        # "url": "http://example.com/baz.jpg",
-        # "name": "The Foo live"
-    # }
-    images: list[Image] | None = None # "images": [
-    #     {
-    #         "url": "http://example.com/baz.jpg",
-    #         "name": "The Foo live"
-    #     },
-    #     {
-    #         "url": "http://example.com/dave.jpg",
-    #         "name": "The Baz"
-    #     }
-    # ]
 
-class Offer(BaseModel):
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
     """
-    Arbitrarily deeply nested models
+    Override request validation exceptions
+    :param request:
+    :param exc:
+    :return: exception along with request body that sent on API - content=jsonable_encoder({"detail": exc.errors(), "body": exc.body})
     """
-    name: str
-    description: str | None = None
-    price: float
-    items: list[Item]
+    print("This is the first handler, RequestValidationError")
+    return PlainTextResponse(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content=jsonable_encoder({"detail": exc.errors(), "body": exc.body}),)
 
-class User(BaseModel):
-    username: str
-    full_name: str | None = None
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(request, exc):
+    """
+    Override the HTTPException error handler
+    :param request:
+    :param exc:
+    :return:
+    """
+    print("This is the first handler, StarletteHTTPException")
+    return PlainTextResponse(str(exc.detail), status_code=exc.status_code)
 
-class FilterParams(BaseModel):
-    model_config = {"extra": "forbid"} # This will restrict the query parameters that you want to receive.
-    # Can't send random param on the route.
+@app.exception_handler(StarletteHTTPException)
+async def custom_http_exception_handler(request, exc):
+    print(f"OMG! An HTTP error!: {repr(exc)}")
+    return await http_exception_handler(request, exc)
 
-    limit: int = Field(100, gt=0, le=100)
-    offset: int = Field(0, ge=0)
-    order_by: Literal["created_at", "updated_at"] = "created_at"
-    tags: list[str] = [] # List of string List[str] is used before Python 3.9 List imported from typing
 
-class Cookies(BaseModel):
-    session_id: str
-    fatebook_tracker: str | None = None
-    googall_tracker: str | None = None
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request, exc):
+    print(f"OMG! The client sent invalid data!: {exc}")
+    return await request_validation_exception_handler(request, exc)
 
-class CommonHeaders(BaseModel):
-    host: str
-    save_data: bool
-    if_modified_since: str | None = None
-    traceparent: str | None = None
-    x_tag: list[str] = []
 
-@app.get("/")
+@app.get("/", summary="Root Route",
+    description="This is the root route for the Fast API app", response_description="The response description")
 async def root():
     """
-    This is the root path for the Project.
+    This is the root path for the Project. if description is given on route then it have priority rather than doc string
+    here.
     :return:
     Hello World as string
     """
     return {"message": "Hello World"}
+
+@app.get("/deprecated/route/", deprecated=True)
+async def deprecated_route():
+    """
+    This will treat the route as deprecated.
+    :return:
+    """
+    return True
 
 @app.get("/items/{item_id}")
 async  def read_item(item_id: int, needy: str, q: str or None = None, short: bool = False):
@@ -504,3 +487,317 @@ async def header_model_items(headers: Annotated[CommonHeaders, Header()]):
     """
     return headers
 
+@app.post("/without/tooling/user/", response_model=UserOut)
+async def create_user(user: UserIn) -> Any:
+    """
+    This is used to understand Body as UserIn model and Output response as UserOut
+    :param user:
+    :return: object of UserOut
+    This may have possibility of complain by mypy. Becuase UserIn and UserOut are different class.
+    """
+    return user
+
+@app.post("/with/tooling/user/")
+async def create_user(user: BaseUserIn) -> BaseUser:
+    """
+    Here this will filterout data based on class defined. Here Both classes are of same so mypy won't complain
+    :param user:
+    :return:
+    """
+    return user
+
+
+@app.get("/portal")
+async def get_portal(teleport: bool = False) -> Response:
+    """
+    This simple case is handled automatically by FastAPI because the return type annotation is the class
+    (or a subclass of) Response.
+    And tools will also be happy because both RedirectResponse and JSONResponse are subclasses of Response, so the
+    type annotation is correct.
+    :param teleport:
+    :return:
+    """
+    if teleport:
+        return RedirectResponse(url="https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+    return JSONResponse(content={"message": "Here's your interdimensional portal."})
+
+@app.get("/teleport")
+async def get_teleport() -> RedirectResponse:
+    """
+    You can also use a subclass of Response in the type annotation:
+    :return:
+    """
+    return RedirectResponse(url="https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+
+
+# @app.get("/invalid/annotation/portal")
+# async def get_portal(teleport: bool = False) -> Response | dict:
+#     """
+#     Invalid annotation
+#     Response and dict have no same class.
+#     like a union between different types where one or more of them are not valid Pydantic types,
+#     this will break the code so i am commenting it out. This is for example purpose/
+#     :param teleport:
+#     :return:
+#     """
+#     if teleport:
+#         return RedirectResponse(url="https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+#     return {"message": "Here's your interdimensional portal."}
+
+@app.get("/disable/annotation/portal", response_model=None)
+async def get_portal(teleport: bool = False) -> Response | dict:
+    """
+    The above invalid annotation will break the code so to avoid it we can use response_model=None
+    :param teleport:
+    :return:
+    """
+    if teleport:
+        return RedirectResponse(url="https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+    return {"message": "Here's your interdimensional portal."}
+
+@app.get("/exclude/unset/items/{item_id}", response_model=Item, response_model_exclude_unset=True)
+async def read_item(item_id: str):
+    """
+    This will omit both default and none values from the response model.
+    response_model_exclude_unset=True will do the trick
+    :param item_id:
+    :return:
+    """
+    return items[item_id]
+
+@app.get("/exclude/default/items/{item_id}", response_model=Item, response_model_exclude_defaults=True)
+async def read_item(item_id: str):
+    """
+    This will omit default values from the response model
+    response_model_exclude_defaults=True do the trick
+    :param item_id:
+    :return:
+    """
+    return items[item_id]
+
+@app.get("/exclude/none/items/{item_id}", response_model=Item, response_model_exclude_none=True)
+async def read_item(item_id: str):
+    """
+    This will omit none values from the response model
+    response_model_exclude_none=True do the trick
+    :param item_id:
+    :return:
+    """
+    return items[item_id]
+
+@app.get("/include/items/{item_id}/name", response_model=Item, response_model_include={"name", "description"},
+)
+async def read_item_name(item_id: str):
+    """
+    This will help you to include only specific fields on the response model.
+    response_model_include will help you for this. Defined in either {} or in []
+    :param item_id:
+    :return:
+    """
+    return items[item_id]
+
+
+@app.get("/include/items/{item_id}/public", response_model=Item, response_model_exclude={"tax"})
+async def read_item_public_data(item_id: str):
+    return items[item_id]
+
+
+@app.post("/create/user/", response_model=BaseUserOut)
+async def create_user(user_in: BaseUserIn):
+    user_saved = fake_save_user(user_in)
+    return user_saved
+
+
+@app.get("/union/items/{item_id}", response_model=Union[PlaneItem, CarItem])
+async def read_item(item_id: str):
+    return items[item_id]
+
+
+@app.get("/keyword-weights/", response_model=dict[str, float])
+async def read_keyword_weights():
+    return {"foo": 2.3, "bar": 3.4}
+
+@app.post("/status/code/items/", status_code=201)
+async def create_item(name: str):
+    return {"name": name}
+
+@app.post("/status/code/status/items/", status_code=status.HTTP_201_CREATED)
+async def create_item(name: str):
+    return {"name": name}
+
+@app.post("/form/login/", tags=[Tags.forms])
+async def login(username: Annotated[str, Form()], password: Annotated[str, Form()]):
+    return {"username": username}
+
+@app.post("/form/model/login/", tags=[Tags.forms])
+async def login(form_data: Annotated[FormData, Form()]):
+    return {"form_data": form_data}
+
+@app.post("/files/", tags=[Tags.files])
+async def create_file(file: Annotated[bytes, File()]):
+    """
+    File upload from form.
+    :param file:
+    :return:
+    """
+    return {"file_size": len(file)}
+
+@app.post("/uploadfile/", tags=[Tags.files])
+async def create_upload_file(file: UploadFile):
+    """
+    Using UploadFile has several advantages over bytes:
+    You don't have to use File() in the default value of the parameter.
+    It uses a "spooled" file:
+    A file stored in memory up to a maximum size limit, and after passing this limit it will be stored in disk.
+    This means that it will work well for large files like images, videos, large binaries, etc. without consuming all the memory.
+    You can get metadata from the uploaded file.
+    It has a file-like async interface.
+    It exposes an actual Python SpooledTemporaryFile object that you can pass directly to other libraries that expect a file-like object.
+
+    :param file:
+    :return:
+    """
+
+    return {"filename": file.filename}
+
+@app.post("/files/", tags=[Tags.files])
+async def create_files(files: Annotated[list[bytes], File()]):
+    """
+    Multiple files from form
+    :param files:
+    :return:
+    """
+    return {"file_sizes": [len(file) for file in files]}
+
+
+@app.post("/uploadfiles/", tags=[Tags.files])
+async def create_upload_files(files: list[UploadFile]):
+    """
+    Multiple files using Upload files
+    :param files:
+    :return:
+    """
+    return {"filenames": [file.filename for file in files]}
+
+@app.post("/form/files/", tags=[Tags.files, Tags.forms])
+async def create_file(
+    file: Annotated[bytes, File()],
+    fileb: Annotated[UploadFile, File()],
+    token: Annotated[str, Form()],
+):
+    return {
+        "file_size": len(file),
+        "token": token,
+        "fileb_content_type": fileb.content_type,
+    }
+
+
+@app.get("/exception/items/{item_id}", tags=[Tags.exceptions])
+async def read_item(item_id: str):
+    if item_id not in items:
+        raise HTTPException(status_code=404, detail="Item not found")
+    return {"item": items[item_id]}
+
+@app.get("/exception/items-header/{item_id}", tags=[Tags.exceptions])
+async def read_item_header(item_id: str):
+    if item_id not in items:
+        raise HTTPException(
+            status_code=404,
+            detail="Item not found",
+            headers={"X-Error": "There goes my error"},
+        )
+    return {"item": items[item_id]}
+
+@app.get("/unicorns/{name}", tags=[Tags.exceptions])
+async def read_unicorn(name: str):
+    if name == "yolo":
+        raise UnicornException(name=name)
+    return {"unicorn_name": name}
+
+@app.get("/custom/exception/items/{item_id}", tags=[Tags.exceptions])
+async def read_item(item_id: int):
+    if item_id == 3:
+        raise HTTPException(status_code=418, detail="Nope! I don't like 3.")
+    return {"item_id": item_id}
+
+@app.patch("/patch/items/{item_id}", response_model=Item)
+async def update_item(item_id: str, item: Item):
+    """
+    To understand http patch.
+    Used for partial update.
+
+    :param item_id:
+    :param item:
+    :return:
+    """
+    stored_item_data = items[item_id]
+    stored_item_model = Item(**stored_item_data)
+    update_data = item.model_dump(exclude_unset=True) # item.dict() deprecated
+    updated_item = stored_item_model.model_copy(update=update_data) # item.copy() deprecated
+    items[item_id] = jsonable_encoder(updated_item)
+    return updated_item
+
+@app.get("/dependency/items/", tags=[Tags.dependency])
+async def dependency_read_items(commons: Annotated[dict, Depends(common_parameters)]):
+    """
+
+    :param commons: this will return a set of parameter. These are the Dependency injection
+    :return:
+    """
+    return commons
+
+
+@app.get("/dependency/users/", tags=[Tags.dependency])
+async def dependency_read_users(commons: Annotated[dict, Depends(common_parameters)]):
+    """
+    :param commons: this will return a set of parameter. These are the Dependency injection
+    :return:
+    """
+    return commons
+
+@app.get("/dependency/class/items/", tags=[Tags.dependency])
+async  def dependency_class_read_items(commons: Annotated[CommonQueryParams, Depends(CommonQueryParams)]):
+    response = {}
+    if commons.q:
+        response.update({"q": commons.q})
+    items = fake_items_db[commons.skip : commons.skip + commons.limit]
+    response.update({"items": items})
+    return response
+
+@app.get("/dependency/class/users/", tags=[Tags.dependency])
+async  def dependency_class_read_items(commons: Annotated[CommonQueryParams, Depends(CommonQueryParams)]):
+    response = {}
+    if commons.q:
+        response.update({"q": commons.q})
+    users = fake_items_db[commons.skip : commons.skip + commons.limit]
+    response.update({"users": users})
+    return response
+
+@app.get("/dependency/dependable/items/", tags=[Tags.dependency])
+async def dependency_dependable_read_query(
+    query_or_default: Annotated[str, Depends(query_or_cookie_extractor)],
+):
+    """
+    This is to understand Dependable and dependent in dependency
+    :param query_or_default:
+    :return:
+    """
+    return {"q_or_cookie": query_or_default}
+
+@app.get("/dependency/list/items/", dependencies=[Depends(verify_token), Depends(verify_key)])
+async def dependency_list_read_items():
+    """
+    This is to understand list of dependencies.
+    Here verify_token and verify_key only applicable in this route if you want to apply globally use in the app iteself.
+    :return:
+    """
+    return [{"item": "Foo"}, {"item": "Bar"}]
+
+@app.get("/dependency/yield/item/{item_id}/", tags=[Tags.dependency])
+def dependency_yield_get_item(item_id: str, username: Annotated[str, Depends(get_username)]):
+    if item_id not in data:
+        raise HTTPException(status_code=404, detail="Item not found")
+    item = data[item_id]
+    if item["owner"] != username:
+        raise OwnerError(username)
+    return item
