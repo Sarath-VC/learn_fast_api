@@ -2,10 +2,16 @@ import random
 from datetime import datetime, time, timedelta
 from uuid import UUID
 
+import jwt
+from jwt.exceptions import InvalidTokenError
+
+from passlib.context import CryptContext
+
 from typing import Annotated, Any, Union
 from fastapi import FastAPI, Query, Path, Body, Cookie, Header, Response, status, Form, File, UploadFile, HTTPException, Request, Depends
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse, RedirectResponse, PlainTextResponse
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.exception_handlers import (
     http_exception_handler,
     request_validation_exception_handler,
@@ -14,17 +20,22 @@ from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from pydantic import AfterValidator
 
-from models import (ModelName, Image, Item, Offer, User, FilterParams, Cookies, CommonHeaders, UserIn, UserOut, BaseUser,
-                    BaseUserIn, BaseUserOut, BaseUserInDB, BaseItem, PlaneItem, CarItem, FormData, Tags)
+from schemas import (ModelName, Image, Item, Offer, User, FilterParams, Cookies, CommonHeaders, UserIn, UserOut, BaseUser,
+                     BaseUserIn, BaseUserOut, BaseUserInDB, BaseItem, PlaneItem, CarItem, FormData, Tags, Token, TokenData)
 from utiles import (check_valid_id, fake_save_user, common_parameters, verify_key, verify_token, query_or_cookie_extractor,
-                    get_username)
-from varaibles import items, base_items, fake_items_db, data, CommonQueryParams
+                    get_username, fake_decode_token, fake_password_hasher, get_user, create_access_token)
+from varaibles import (items, base_items, fake_items_db, data, CommonQueryParams, yield_items, fake_users_db,
+                       SECRET_KEY, ACCESS_TOKEN_EXPIRE_MINUTES, ALGORITHM)
 from exceptions import UnicornException, OwnerError
 
 app = FastAPI()
 # app = FastAPI(dependencies=[Depends(verify_token), Depends(verify_key)])
 # By adding dependencies in the app itself will declare the dependencies as global.
 # So it will be available in whole application.
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
 
 
 
@@ -75,6 +86,58 @@ async def validation_exception_handler(request, exc):
     print(f"OMG! The client sent invalid data!: {exc}")
     return await request_validation_exception_handler(request, exc)
 
+async def get_current_user(token: Annotated[str, Depends(oauth2_scheme)]):
+    # PWD CONCEPT
+    # user = fake_decode_token(token)
+    # if not user:
+    #     raise HTTPException(
+    #         status_code=status.HTTP_401_UNAUTHORIZED,
+    #         detail="Invalid authentication credentials",
+    #         headers={"WWW-Authenticate": "Bearer"},
+    #     )
+    # return user
+
+#     JWT CONCEPT
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username = payload.get("sub")
+        if username is None:
+            raise credentials_exception
+        token_data = TokenData(username=username)
+    except InvalidTokenError:
+        raise credentials_exception
+    user = get_user(fake_users_db, username=token_data.username)
+    if user is None:
+        raise credentials_exception
+    return user
+
+
+async def get_current_active_user(
+    current_user: Annotated[BaseUser, Depends(get_current_user)],
+):
+    if current_user.disabled:
+        raise HTTPException(status_code=400, detail="Inactive user")
+    return current_user
+
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
+
+
+def get_password_hash(password):
+    return pwd_context.hash(password)
+
+def authenticate_user(fake_db, username: str, password: str):
+    user = get_user(fake_db, username)
+    if not user:
+        return False
+    if not verify_password(password, user.hashed_password):
+        return False
+    return user
 
 @app.get("/", summary="Root Route",
     description="This is the root route for the Fast API app", response_description="The response description")
@@ -795,9 +858,54 @@ async def dependency_list_read_items():
 
 @app.get("/dependency/yield/item/{item_id}/", tags=[Tags.dependency])
 def dependency_yield_get_item(item_id: str, username: Annotated[str, Depends(get_username)]):
-    if item_id not in data:
+    if item_id not in yield_items:
         raise HTTPException(status_code=404, detail="Item not found")
-    item = data[item_id]
+    item = yield_items[item_id]
     if item["owner"] != username:
         raise OwnerError(username)
     return item
+
+@app.get("/auth/login/", tags=[Tags.auth])
+async def login_auth(token: Annotated[str, Depends(oauth2_scheme)]):
+    """
+    This will help you to auth using OAuth2
+    :param token:
+    :return:
+    """
+    return token
+
+@app.post("/token", tags=[Tags.auth])
+async def login(form_data: Annotated[OAuth2PasswordRequestForm, Depends()]):
+    user_dict = fake_users_db.get(form_data.username)
+    if not user_dict:
+        raise HTTPException(status_code=400, detail="Incorrect username or password")
+    user = BaseUserInDB(**user_dict)
+    hashed_password = fake_password_hasher(form_data.password)
+    if not hashed_password == user.hashed_password:
+        raise HTTPException(status_code=400, detail="Incorrect username or password")
+
+    return {"access_token": user.username, "token_type": "bearer"}
+
+@app.post("/jwt/token", tags=[Tags.auth])
+async def login_for_access_token(
+    form_data: Annotated[OAuth2PasswordRequestForm, Depends()],) -> Token:
+    user = authenticate_user(fake_users_db, form_data.username, form_data.password)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": user.username}, expires_delta=access_token_expires
+    )
+    return Token(access_token=access_token, token_type="bearer")
+
+
+
+@app.get("/users/me", tags=[Tags.auth])
+async def read_users_me(
+    current_user: Annotated[BaseUser, Depends(get_current_active_user)],
+):
+    return current_user

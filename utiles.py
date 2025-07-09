@@ -1,9 +1,13 @@
 from typing import Annotated
 from fastapi import Depends, Cookie, Header
 from fastapi.exceptions import HTTPException
+from datetime import timedelta, datetime, timezone
+import jwt
 
-from models import BaseUserIn, BaseUserInDB
+from schemas import BaseUserIn, BaseUserInDB, BaseUser
 from exceptions import OwnerError
+from context_manager import MySuperContextManager
+from varaibles import fake_users_db, SECRET_KEY, ALGORITHM, ACCESS_TOKEN_EXPIRE_MINUTES
 
 
 
@@ -13,7 +17,7 @@ def check_valid_id(id: str):
     return id
 
 def fake_password_hasher(raw_password: str):
-    return "supersecret" + raw_password
+    return "fakehashed" + raw_password
 
 
 def fake_save_user(user_in: BaseUserIn):
@@ -70,4 +74,35 @@ def get_username():
     except OwnerError as e:
         raise HTTPException(status_code=400, detail=f"Owner error: {e}")
 
+
+async def get_db():
+    with MySuperContextManager() as db:
+        yield db
+
+
+def fake_decode_token(token):
+    return BaseUser(
+        username=token + "fakedecoded", email="john@example.com", full_name="John Doe"
+    )
+
+def get_user(db, username: str):
+    if username in db:
+        user_dict = db[username]
+        return BaseUserInDB(**user_dict)
+
+def fake_decode_token(token):
+    # This doesn't provide any security at all
+    # Check the next version
+    user = get_user(fake_users_db, token)
+    return user
+
+def create_access_token(data: dict, expires_delta: timedelta | None = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.now(timezone.utc) + expires_delta
+    else:
+        expire = datetime.now(timezone.utc) + timedelta(minutes=15)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
 
